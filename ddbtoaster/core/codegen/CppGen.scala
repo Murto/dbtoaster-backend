@@ -332,13 +332,72 @@ trait ICppGen extends CodeGen {
           case None => sys.error("No if condition")
         }        
       )
+
+    case s: SerialBlock =>
+      emitSerialBlock(s)
+
+    case s: ParallelBlock =>
+      emitParallelBlock(s)
+
+    case s: ParallelTask =>
+      emitParallelTask(s)
+
   }
 
+  private def emitDependencies(in: Set[String], out: Set[String]): String = {
+    val inDeps = in match {
+      case in if in.isEmpty => ""
+      case in => s" depend(in: ${in.mkString(", ")})"
+    }
+    val outDeps = out match {
+      case out if out.isEmpty => ""
+      case out => s" depend(out: ${out.mkString(", ")})"
+    }
+    inDeps + outDeps
+  }
+
+  private def emitReference(name: String): String = {
+    s"auto& ${name} = this->${name};"
+  }
+
+  private def emitShared(vars: Set[String]): String = {
+    if (vars.nonEmpty) {
+      s"shared(${vars.mkString(",")})"
+    } else {
+      ""
+    }
+  }
+
+  private def emitSerialBlock(block: SerialBlock): String = {
+    block.stmts.map(emitStmt).mkString("\n")
+  }
+
+  private def emitParallelBlock(decl: ParallelBlock): String = {
+    val threadDecl = decl.threads match {
+      case Some(n) => s" num_threads($n)"
+      case None => ""
+    }
+    val tasks = decl.stmts.map(emitStmt).mkString("\n")
+    s"\n#pragma omp parallel$threadDecl default(shared)\n{\n#pragma omp single nowait\n{\n${tasks}\n}\n}\n" 
+  }
+
+  private def emitParallelTask(s: ParallelTask): String = {
+    val deps = emitDependencies(s.inDeps, s.outDeps)
+    val stmt = emitStmt(s.stmt)
+    s"#pragma omp task default(shared)$deps\n{\n$stmt\n}"
+  }
+
+
   private def emitTrigger(t: Trigger): String = {
+
+    // Generate dependecies and references
+    val deps = t.stmts.collect { case (pb: ParallelBlock) => pb.deps }.flatten.toSet
+    val references = deps.map(emitReference).mkString("\n")
+
     // Generate trigger statements    
     val sTriggerBody = {
       ctx = Ctx(t.event.params.map { case (n, tp) => (n, (tp, n)) }.toMap)
-      val body = t.stmts.map(emitStmt).mkString("\n")
+      val body = references + t.stmts.map(emitStmt).mkString("\n")
       ctx = null
       body
     }

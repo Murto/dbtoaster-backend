@@ -334,6 +334,18 @@ object M3 {
       "}"
   }
 
+  case class SerialBlock(stmts: List[Statement]) extends Statement {
+    override def toString = s"SERIAL BLOCK {\n${stmts.mkString("\n")}"
+  }
+
+  case class ParallelBlock(stmts: List[ParallelTask], deps: Set[String], threads: Option[Int]) extends Statement {
+    override def toString = "PARALLEL BLOCK {\n" + stmts.mkString("\n") + "\n}"
+  }
+
+  case class ParallelTask(stmt: Statement, inDeps: Set[String], outDeps: Set[String]) extends Statement {
+    override def toString = "PARALLEL TASK {\n" + stmt + "\n}"
+  }
+
   // ---------- Expressions (values)
   sealed abstract class Expr extends M3 {
     def tp: Type                          // expression type

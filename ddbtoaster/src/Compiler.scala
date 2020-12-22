@@ -34,6 +34,9 @@ object Compiler {
   val LANG_SPARK_LMS = "spark"
   val LANG_AKKA = "akka"
 
+  val POLICY_FINE = "fine"
+  val POLICY_COARSE = "coarse"
+
   val frontendFileExtensions = Map(
       LANG_CALC -> "calc",
       LANG_M3 -> "m3",
@@ -103,6 +106,12 @@ object Compiler {
   private var useExternalScalac = false        // compile using fsc / external scalac
   private var useExternalJVM = false           // execute in a fresh JVM
 
+  // Parallelization options
+  private var parallelization : String = null
+  private var parOpts = List.empty[String]
+  private var parOptLevel = 1
+  private var useParallelCppHashMap = false
+
   // private var ni   = false     // non-incremental query evaluation (implies depth=0)
   // private var watch  = false    // stream of updates on result map
 
@@ -163,6 +172,12 @@ object Compiler {
     error("  -preload      preload input datasets")
     error("Backward compatibility:")
     error("  -xruntime     use old C++ runtime library")
+    error("Parallelization options:")
+    error("  --parallel <strategy>    generate parallel C++ with the given strategy")
+    error("                           - fine  : liberal parallelization strategy")
+    error("                           - coarse : comservative parallelization strategy")
+    error("  -P[012]                  optimization level for parallelization of M3 (default: -P1)")
+    error("  -P <flag>                enable a specific parallelization optimization")
     error("", true)     // exit here
   }
 
@@ -222,6 +237,10 @@ object Compiler {
 
     useOldCppRuntimeLibrary = false
 
+    parallelization = null
+    parOpts = List.empty[String]
+    parOptLevel = 1
+
     useExternalScalac = false
     useExternalJVM = false
   }
@@ -280,6 +299,9 @@ object Compiler {
         case "-opt" => eat(s => opts(s), true)
         case s @ "--no-output" => execArgs = execArgs ::: List(s)
         case s if s.matches("-O[123]") => frontendOptLevel = s;
+        case "--parallel" => eat(p => parallelization = p, true)
+        case s if s.matches("-P[012]") => parOptLevel = s.substring(2).toInt
+        case "-P" => eat(s => parOpts = s :: parOpts, true)
         case s if s.startsWith("--") => execArgs = execArgs ::: List(s.substring(1)) // --flag is a shorthand for -xa -flag
         case s => inputFiles = inputFiles ::: List(s)
       }
@@ -385,7 +407,20 @@ object Compiler {
   def codegen(sourceM3: String, lang: String, codegenOpts: CodeGenOptions): String = {
 
     // Front-end phases
-    val m3 = string2AST(sourceM3)
+    var m3 = string2AST(sourceM3)
+
+    // Parallelization
+    if (parallelization != null) {
+      val parallelizer = parallelization match {
+        case POLICY_FINE => FineParallelizer
+        case POLICY_COARSE=> CoarseParallelizer
+        case _ => throw new IllegalArgumentException(s"Unsupported parallelization policy: $parallelization")
+      }
+      parallelizer.resetOpts()
+      parallelizer.setOptLevel(parOptLevel)
+      parOpts.map(parallelizer.setOpt)
+      m3 = parallelizer(m3)
+    }
 
     // Back-end
     val codegen: CodeGen = lang match {
