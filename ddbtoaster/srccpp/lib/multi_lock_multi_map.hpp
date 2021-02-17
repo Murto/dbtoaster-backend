@@ -8,30 +8,32 @@
 #include "macro.hpp"
 #include "types.hpp"
 #include "serialization.hpp"
-#include "uniform_memory_pool.hpp"
-#include "trivial_uniform_memory_pool.hpp"
+#include "no_wait_memory_pool.hpp"
+#include "no_wait_trivial_memory_pool.hpp"
 #include "singleton.hpp"
+#include "lock_omp.hpp"
 
 using namespace dbtoaster;
 
 namespace dbtoaster {
 
 template <typename T>
-using MemoryPool = memory_pool::UniformMemoryPool<T>;
+using MemoryPool = memory_pool::NoWaitMemoryPool<T>;
 
 template <typename T>
-using TrivialMemoryPool = memory_pool::TrivialUniformMemoryPool<T>;
+using TrivialMemoryPool = memory_pool::NoWaitTrivialMemoryPool<T>;
 
 constexpr bool isPowerOfTwo(std::size_t v) {
   return v && ((v & (v - 1)) == 0);
 }
 
 constexpr std::size_t kDefaultChunkSize = 32;  // 2^N
+constexpr std::size_t kDefaultMapCount = 8;  // 2^N
 
-template <typename T, typename IDX_FN = T>
+template <typename T, typename IDX_FN = T, std::size_t N = kDefaultMapCount>
 class PrimaryHashIndex {
  private: 
-  struct IdxNode {
+  struct alignas(64) IdxNode {
     T* obj{nullptr};
     HashType hash;
     IdxNode* next{nullptr};
@@ -48,6 +50,8 @@ class PrimaryHashIndex {
   std::size_t index_mask_;     // derived value
   std::size_t threshold_;      // derived value
   const double load_factor_;
+  mutable Lock locks_[N];
+  mutable Lock lock_;
 
   void resize(std::size_t new_size);
 
@@ -65,19 +69,26 @@ class PrimaryHashIndex {
   void clear();
 
   FORCE_INLINE std::size_t size() const {
-    return entry_count_;
+    std::size_t current_entry_count;
+    #pragma omp atomic read
+    current_entry_count = entry_count_;
+    return current_entry_count;
   }
 
-  FORCE_INLINE HashType computeHash(const T& key) { 
+  FORCE_INLINE HashType computeHash(const T& key) const { 
     return IDX_FN::hash(key); 
   }
 
-  FORCE_INLINE T* get(const T& key) const {
+  FORCE_INLINE T* get(const T& key) {
     return get(key, IDX_FN::hash(key));
   }
 
   // Returns the first matching element or nullptr if not found
-  T* get(const T& key, const HashType h) const {
+  T* get(const T& key, const HashType h) {
+    return get_lockless(key, h);
+  }
+
+  T* get_lockless(const T& key, const HashType h) const {
     IdxNode* head_idx = buckets_ + (h & index_mask_);
     IdxNode* curr_idx = head_idx->obj ? head_idx : nullptr;
     while (curr_idx != nullptr) {
@@ -89,16 +100,100 @@ class PrimaryHashIndex {
     return {};
   }
 
+  template <typename S, typename F>
+  auto get(const T& key, S on_success, F on_failure) {
+    return get(key, IDX_FN::hash(key), on_success, on_failure);
+  }
+
+  template <typename S, typename F>
+  auto get(const T& key, const HashType h, S on_success, F on_failure) {
+    lock_.lock();
+    if (entry_count_ > threshold_) {
+      resize(bucket_count_ << 1);
+    }
+    std::size_t bucket_index = h & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    T* elem = get_lockless(key, h);
+    if constexpr (!std::is_same<decltype(on_failure()), void>::value) {
+      if (elem) {
+        decltype(auto) result = on_success(elem);
+        locks_[submap_index].unlock();
+        return result;
+      } else {
+        decltype(auto) result = on_failure();
+        locks_[submap_index].unlock();
+        return result;
+      }
+    } else {
+      if (elem) {
+        on_success(elem);
+        locks_[submap_index].unlock();
+      } else {
+        on_failure();
+        locks_[submap_index].unlock();
+      }
+    }
+  }
+
+  template <typename S, typename F>
+  auto get(const T& key, S on_success, F on_failure) const {
+    return get(key, IDX_FN::hash(key), on_success, on_failure);
+  }
+
+  template <typename S, typename F>
+  auto get(const T& key, const HashType h, S on_success, F on_failure) const {
+    lock_.lock();
+    if (entry_count_ > threshold_) {
+      resize(bucket_count_ << 1);
+    }
+    std::size_t bucket_index = h & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    T* elem = get_lockless(key, h);
+    if constexpr (!std::is_same<decltype(on_failure()), void>::value) {
+      if (elem) {
+        decltype(auto) result = on_success(elem);
+        locks_[submap_index].unlock();
+        return result;
+      } else {
+        decltype(auto) result = on_failure();
+        locks_[submap_index].unlock();
+        return result;
+      }
+    } else {
+      if (elem) {
+        locks_[submap_index].unlock();
+        on_success(elem);
+      } else {
+        locks_[submap_index].unlock();
+        on_failure();
+      }
+    }
+  }
+
   FORCE_INLINE void insert(T* obj) {
     if (obj) insert(obj, IDX_FN::hash(*obj)); 
   }
 
   // Inserts regardless of whether element already exists
   FORCE_INLINE void insert(T* obj, const HashType h) {
+    lock_.lock();
+    if (entry_count_ > threshold_) {
+      resize(bucket_count_ << 1);
+    }
+    std::size_t bucket_index = h & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    insert_lockless(obj, h);
+    locks_[submap_index].unlock();
+  }
+  
+  FORCE_INLINE void insert_lockless(T* obj, const HashType h) {
     assert(obj);
-
-    if (entry_count_ > threshold_) { resize(bucket_count_ << 1); }
-
     IdxNode& head = buckets_[h & index_mask_];
     if (head.obj) {
       IdxNode* new_node = pool_->acquire();
@@ -110,13 +205,28 @@ class PrimaryHashIndex {
       head.obj = obj;
       head.hash = h;
     }
-    ++entry_count_;
+    #pragma omp atomic update
+    entry_count_ += 1;
   }
 
   FORCE_INLINE void insert(IdxNode* handle) {
     assert(handle);
+    
+    lock_.lock();
+    if (entry_count_ > threshold_) {
+      resize(bucket_count_ << 1);
+    }
+    std::size_t bucket_index = handle->hash & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    insert_lockless(handle);
+    locks_[submap_index].unlock();
+  }
 
-    if (entry_count_ > threshold_) { resize(bucket_count_ << 1); }
+
+  FORCE_INLINE void insert_lockless(IdxNode* handle) {
+    assert(handle);
 
     IdxNode& head = buckets_[handle->hash & index_mask_];
     if (!head.obj) {
@@ -127,7 +237,8 @@ class PrimaryHashIndex {
       handle->next = head.next;
       head.next = handle;
     }
-    ++entry_count_;
+    #pragma omp atomic update
+    entry_count_ += 1;
   }
 
   void erase(const T* obj) {
@@ -135,29 +246,42 @@ class PrimaryHashIndex {
   }
 
   void erase(const T* obj, const HashType h) {
+    lock_.lock();
+    std::size_t bucket_index = h & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    erase_lockless(obj, h);
+    locks_[submap_index].unlock();
+  }
+  
+  void erase_lockless(const T* obj, const HashType h) {
     assert(obj);
     IdxNode& head = buckets_[h & index_mask_];
-    IdxNode** curr = &head.next;
     if (!head.obj) {
       return;
     }
     if (head.obj == obj) {
-      if (*curr) {
-        head.obj = (*curr)->obj;
-        head.hash = (*curr)->hash;
-        head.next = (*curr)->next;
-        pool_->release(*curr);
+      IdxNode* curr = head.next;
+      if (curr) {
+        head.obj = curr->obj;
+        head.hash = curr->hash;
+        head.next = curr->next;
+        pool_->release(curr);
       } else {
         head.obj = {};
       }
-      --entry_count_;
+      #pragma omp atomic update
+      entry_count_ -= 1;
     } else {
+      IdxNode** curr = &head.next;
       while (*curr) {
         IdxNode*& next = (*curr)->next;
         if ((*curr)->obj == obj) { // * comparison sufficient
           pool_->release(*curr);
           *curr = next;
-          --entry_count_;
+          #pragma omp atomic update
+          entry_count_ -= 1;
           break;
         }
         curr = &next;
@@ -168,15 +292,10 @@ class PrimaryHashIndex {
   template <typename U, typename V, typename PRIMARY_INDEX, typename... SECONDARY_INDEXES> 
   friend class MultiHashMap;
 
-  void dumpStatistics(bool verbose = false) const;
-  std::size_t bucketSize(std::size_t bucket_id) const;
-  double avgEntriesPerBucket() const;
-  double stdevEntriesPerBucket() const;
-  std::size_t maxEntriesPerBucket() const;
 };
 
-template <typename T, typename IDX_FN>
-PrimaryHashIndex<T, IDX_FN>::~PrimaryHashIndex() {
+template <typename T, typename IDX_FN, std::size_t N>
+PrimaryHashIndex<T, IDX_FN, N>::~PrimaryHashIndex() {
   clear();
   delete[] buckets_;
   buckets_ = nullptr;
@@ -184,8 +303,8 @@ PrimaryHashIndex<T, IDX_FN>::~PrimaryHashIndex() {
   pool_ = nullptr;
 }
 
-template <typename T, typename IDX_FN>
-void PrimaryHashIndex<T, IDX_FN>::clear() {
+template <typename T, typename IDX_FN, std::size_t N>
+void PrimaryHashIndex<T, IDX_FN, N>::clear() {
   if (entry_count_ == 0) return;
 
   for (std::size_t i = 0; i < bucket_count_; ++i) {
@@ -195,18 +314,34 @@ void PrimaryHashIndex<T, IDX_FN>::clear() {
   entry_count_ = 0;
 }
 
-template <typename T, typename IDX_FN>
-void PrimaryHashIndex<T, IDX_FN>::resize(std::size_t new_size) {
+template <typename T, typename IDX_FN, std::size_t N>
+void PrimaryHashIndex<T, IDX_FN, N>::resize(std::size_t new_count) {
+
+  // Assume owning `lock_`
+
+  // Reserve the entire hash table
+  for (std::size_t i = 0; i < N; ++i) {
+    locks_[i].lock();
+  }
+
   IdxNode* old_buckets = buckets_;
   std::size_t old_bucket_count = bucket_count_;
-  buckets_ = new IdxNode[new_size];
+  buckets_ = new IdxNode[new_count];
 
-  bucket_count_ = new_size;
+  bucket_count_ = new_count;
   index_mask_ = bucket_count_ - 1;
   threshold_ = bucket_count_ * load_factor_;
 
-  // Rehash entries
   entry_count_ = 0;
+
+  lock_.unlock();
+  // Unreserve the entire hashtable
+  for (std::size_t i = 0; i < N; ++i) {
+    locks_[i].unlock();
+  }
+
+
+  // Rehash entries
   for (std::size_t i = 0; i < old_bucket_count; ++i) {
     IdxNode& head = old_buckets[i];
     if (head.obj) {
@@ -220,64 +355,8 @@ void PrimaryHashIndex<T, IDX_FN>::resize(std::size_t new_size) {
     }
   }
 
+ 
   delete[] old_buckets;
-}
-
-template <typename T, typename IDX_FN>
-void PrimaryHashIndex<T, IDX_FN>::dumpStatistics(bool verbose) const {
-  std::cout << "# of entries: " << entry_count_ << '\n';
-  std::cout << "# of buckets: " << bucket_count_ << '\n';
-  std::cout << "avg # of entries per bucket " << avgEntriesPerBucket() << '\n';
-  std::cout << "stdev # of entries per bucket " << stdevEntriesPerBucket() << '\n';
-  std::cout << "max # of entries per bucket " << maxEntriesPerBucket() << '\n';
-  if (verbose) {
-    for (std::size_t i = 0; i < bucket_count_; ++i) {
-      std::cout << "bucket[" << i << "] = " << bucketSize(i) << '\n';  
-    }
-  }
-  std::cout << std::flush;
-}
-
-template <typename T, typename IDX_FN>
-std::size_t PrimaryHashIndex<T, IDX_FN>::bucketSize(std::size_t bucket_id) const {
-  assert(0 <= bucket_id && bucket_id < bucket_count_);
-  IdxNode& head = buckets_[bucket_id];
-  if (!head.obj) {
-    return 0;
-  }
-  std::size_t cnt = 1;
-  IdxNode* n = head.next;
-  while (n) {
-    ++cnt;
-    n = n->next;
-  }
-  return cnt;
-}
-
-template <typename T, typename IDX_FN>
-double PrimaryHashIndex<T, IDX_FN>::avgEntriesPerBucket() const {
-  return static_cast<double>(entry_count_) / bucket_count_;
-}
-
-template <typename T, typename IDX_FN>
-double PrimaryHashIndex<T, IDX_FN>::stdevEntriesPerBucket() const {
-  double avg = avgEntriesPerBucket();
-  double sum = 0.0;
-  for (std::size_t i = 0; i < bucket_count_; ++i) {
-    std::size_t cnt = bucketSize(i);
-    sum += (cnt - avg) * (cnt - avg);
-  }
-  return sqrt(sum / bucket_count_);
-}
-
-template <typename T, typename IDX_FN>
-std::size_t PrimaryHashIndex<T, IDX_FN>::maxEntriesPerBucket() const {
-  std::size_t max = 0;
-  for (std::size_t i = 0; i < bucket_count_; ++i) {
-    std::size_t cnt = bucketSize(i);
-    if (cnt > max) { max = cnt; }
-  }
-  return max;
 }
 
 template <typename T>
@@ -286,7 +365,7 @@ struct LinkedNodeBase {
   LinkedNodeBase* next{nullptr};
 };
 
-template <typename T, typename IDX_FN = T>
+template <typename T, typename IDX_FN = T, std::size_t N = kDefaultMapCount>
 class SecondaryHashIndex {
  public:
  
@@ -299,9 +378,7 @@ class SecondaryHashIndex {
   };
   
   using TMemoryPool = MemoryPool<T>;
-
   using IdxNodeMemoryPool = TrivialMemoryPool<IdxNode>;
- 
   using LinkedNodeMemoryPool = TrivialMemoryPool<LinkedNode>;
 
  private:
@@ -313,6 +390,8 @@ class SecondaryHashIndex {
   std::size_t index_mask_;   // derived value
   std::size_t threshold_;    // derived value
   double load_factor_;
+  mutable Lock locks_[N];
+  mutable Lock lock_;
 
   void resize(std::size_t new_size);
   void deleteBucket(IdxNode& bucket);
@@ -326,21 +405,35 @@ class SecondaryHashIndex {
     resize(size);
   }
 
-  virtual ~SecondaryHashIndex();
+  ~SecondaryHashIndex();
 
   void clear();
 
   FORCE_INLINE std::size_t size() const {
-    return entry_count_;
+    std::size_t current_entry_count;
+    #pragma omp atomic read
+    current_entry_count = entry_count_;
+    return current_entry_count;
   }
 
-  LinkedNode* slice(const T& key) {
+  LinkedNode* slice(const T& key) const {
     return slice(key, IDX_FN::hash(key));
   }
 
   // returns the first matching node or nullptr if not found
   // NOTE: Assumes that there is at least one linked node for each idx node
   LinkedNode* slice(const T& key, const HashType h) const {
+    lock_.lock();
+    std::size_t bucket_index = h & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    auto result = slice_lockless(key, h);
+    locks_[submap_index].unlock();
+    return result;
+  }
+  
+  LinkedNode* slice_lockless(const T& key, const HashType h) const {
     IdxNode* head_idx = buckets_ + (h & index_mask_);
     IdxNode* curr_idx = head_idx->node.obj ? head_idx : nullptr;
     while (curr_idx != nullptr) {
@@ -358,9 +451,20 @@ class SecondaryHashIndex {
 
   // Inserts regardless of whether element already exists
   FORCE_INLINE void insert(T* obj, const HashType h) {
+    lock_.lock();
+    if (entry_count_ > threshold_) {
+      resize(bucket_count_ << 1);
+    }
+    std::size_t bucket_index = h & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    insert_lockless(obj, h);
+    locks_[submap_index].unlock();
+  }
+  
+  FORCE_INLINE void insert_lockless(T* obj, const HashType h) {
     assert(obj);
-
-    if (entry_count_ > threshold_) { resize(bucket_count_ << 1); }
 
     IdxNode& head = buckets_[h & index_mask_];
 
@@ -383,13 +487,13 @@ class SecondaryHashIndex {
         head.node.obj = obj;
         head.hash = h;
       }
-      ++entry_count_;       // Count only distinct elements for non-unique index
+      #pragma omp atomic update
+      entry_count_ += 1;       // Count only distinct elements for non-unique index
     }
   }
 
   // NOTE: Assumes that the hash does not already exist in the map
-  FORCE_INLINE void insert(LinkedNode&& node, const HashType h) {
-    if (entry_count_ > threshold_) { resize(bucket_count_ << 1); }
+  FORCE_INLINE void insert_lockless(LinkedNode&& node, const HashType h) {
 
     IdxNode& head = buckets_[h & index_mask_];
     if (head.node.obj) {
@@ -401,13 +505,12 @@ class SecondaryHashIndex {
       head.node = std::move(node);
       head.hash = h;
     }
-    ++entry_count_;
+    #pragma omp atomic update
+    entry_count_ += 1;
   }
 
-  FORCE_INLINE void insert(IdxNode* handle) {
+  FORCE_INLINE void insert_lockless(IdxNode* handle) {
     assert(handle);
-
-    if (entry_count_ > threshold_) { resize(bucket_count_ << 1); }
 
     IdxNode& head = buckets_[handle->hash & index_mask_];
     if (head.node.obj) {
@@ -418,7 +521,8 @@ class SecondaryHashIndex {
       head.hash = handle->hash;
       idxNodePool_->release(handle);
     }
-    ++entry_count_;
+    #pragma omp atomic update
+    entry_count_ += 1;
   }
 
   void erase(const T* obj) {
@@ -427,9 +531,17 @@ class SecondaryHashIndex {
 
   // Deletes an existing element
   void erase(const T* obj, const HashType h) {
+    lock_.lock();
+    std::size_t bucket_index = h & index_mask_;
+    std::size_t submap_index = bucket_index / (bucket_count_ / N);
+    locks_[submap_index].lock();
+    lock_.unlock();
+    erase_lockless(obj, h);
+    locks_[submap_index].unlock();
+  }
+  
+  void erase_lockless(const T* obj, const HashType h) {
     assert(obj);
-
-    std::cout << "ERASE" << std::endl;
 
     IdxNode* head_idx = buckets_ + (h & index_mask_);
     IdxNode* curr_idx = head_idx->node.obj ? head_idx : nullptr;
@@ -453,7 +565,8 @@ class SecondaryHashIndex {
               IdxNode* next_handle = curr_idx->next;
               idxNodePool_->release(*curr_idx_handle);
               *curr_idx_handle = next_handle;
-              --entry_count_;
+              #pragma omp atomic update
+              entry_count_ -= 1;
 
             // Case linked node is head of chain and idx node is head of bucket
             } else {
@@ -467,7 +580,8 @@ class SecondaryHashIndex {
                 curr_idx->node.obj = next_obj;
                 curr_idx->node.next = next_node;
               }
-              --entry_count_;
+              #pragma omp atomic
+              entry_count_ -= 1;
 
             }
             return; // Erased from index
@@ -483,8 +597,8 @@ class SecondaryHashIndex {
   }
 };
 
-template <typename T, typename IDX_FN>
-SecondaryHashIndex<T, IDX_FN>::~SecondaryHashIndex() {
+template <typename T, typename IDX_FN, std::size_t N>
+SecondaryHashIndex<T, IDX_FN, N>::~SecondaryHashIndex() {
   clear();
   delete[] buckets_;
   buckets_ = nullptr;
@@ -494,8 +608,15 @@ SecondaryHashIndex<T, IDX_FN>::~SecondaryHashIndex() {
   linkedNodePool_ = nullptr;  
 }
 
-template <typename T, typename IDX_FN>
-void SecondaryHashIndex<T, IDX_FN>::resize(std::size_t new_size) {
+template <typename T, typename IDX_FN, std::size_t N>
+void SecondaryHashIndex<T, IDX_FN, N>::resize(std::size_t new_size) {
+
+  // Assume owning `lock_`
+
+  for (std::size_t i = 0; i < N; ++i) {
+    locks_[i].lock();
+  }
+
   IdxNode* old_buckets = buckets_;
   std::size_t old_bucket_count = bucket_count_;
   buckets_ = new IdxNode[new_size];
@@ -508,21 +629,26 @@ void SecondaryHashIndex<T, IDX_FN>::resize(std::size_t new_size) {
   for (std::size_t i = 0; i < old_bucket_count; ++i) {
     IdxNode& head = old_buckets[i];
     if (head.node.obj) {
-      insert(std::move(head.node), head.hash);
+      insert_lockless(std::move(head.node), head.hash);
       IdxNode* curr = head.next;
       while (curr) {
         IdxNode* next = curr->next;
-        insert(curr);
+        insert_lockless(curr);
         curr = next;
       }
     }
+  }
+  
+  // Unreserve the entire hashtable
+  for (std::size_t i = 0; i < N; ++i) {
+    locks_[i].unlock();
   }
 
   delete[] old_buckets;
 }
 
-template <typename T, typename IDX_FN>
-void SecondaryHashIndex<T, IDX_FN>::deleteBucket(IdxNode& head) {
+template <typename T, typename IDX_FN, std::size_t N>
+void SecondaryHashIndex<T, IDX_FN, N>::deleteBucket(IdxNode& head) {
   linkedNodePool_->releaseChain(head.node.next, [](const LinkedNode* t) { return t->next; });
   IdxNode* curr = head.next;
   while (curr) {
@@ -535,8 +661,8 @@ void SecondaryHashIndex<T, IDX_FN>::deleteBucket(IdxNode& head) {
   head.next = {};
 }
 
-template <typename T, typename IDX_FN>
-void SecondaryHashIndex<T, IDX_FN>::clear() {
+template <typename T, typename IDX_FN, std::size_t N>
+void SecondaryHashIndex<T, IDX_FN, N>::clear() {
   if (entry_count_ == 0) return;
 
   for (std::size_t i = 0; i < bucket_count_; ++i) {
@@ -557,7 +683,7 @@ struct SecondaryIndexList<T, SECONDARY_INDEX, SECONDARY_INDEXES...> {
 
   SecondaryIndexList(std::size_t init_capacity) : index{init_capacity}, next{init_capacity} {}
 
-  FORCE_INLINE typename SECONDARY_INDEX::LinkedNode* slice(const T& key, std::size_t idx) {
+  FORCE_INLINE typename SECONDARY_INDEX::LinkedNode* slice(const T& key, std::size_t idx) const {
     if (idx == 0) {
       return index.slice(key);
     } else {
@@ -591,7 +717,7 @@ struct SecondaryIndexList<T, SECONDARY_INDEX> {
 
   SecondaryIndexList(std::size_t init_capacity) : index{init_capacity} {}
 
-  FORCE_INLINE typename SECONDARY_INDEX::LinkedNode* slice(const T& key, std::size_t idx) {
+  FORCE_INLINE typename SECONDARY_INDEX::LinkedNode* slice(const T& key, std::size_t idx) const {
     return index.slice(key);
   }
 
@@ -636,7 +762,6 @@ class MultiHashMap {
   
   FORCE_INLINE void insert(const T& elem, HashType h) {
     T* curr = pool_.acquire(elem);
-
     primary_index_.insert(curr, h);
     secondary_indexes_.insert(curr);
   }
@@ -651,8 +776,9 @@ class MultiHashMap {
 
   void erase(const T& k) {
     HashType h = primary_index_.computeHash(k);
-    T* elem = primary_index_.get(k, h);
-    if (elem) erase(elem, h);
+    primary_index_.get(k, h, [&] (auto elem) {
+      erase(elem, h);
+    }, [] {});
   }
 
   void insert(const T& k) {
@@ -675,14 +801,16 @@ class MultiHashMap {
     return primary_index_.size();
   }
 
-  FORCE_INLINE const T* get(const T& key) const {
+  FORCE_INLINE const T* get(const T& key) {
     return primary_index_.get(key);
   }
 
-  FORCE_INLINE const V& getValueOrDefault(const T& key) const {
-    T* elem = primary_index_.get(key);
-    if (elem) return elem->__av;
-    return Value<V>::zero;
+  FORCE_INLINE const V getValueOrDefault(const T& key) const {
+    return primary_index_.get(key, [&] (auto elem) -> const V {
+      return elem->__av;
+    } , [] () -> const V {
+      return Value<V>::zero;
+    });
   }
   
   template <typename F>
@@ -704,42 +832,55 @@ class MultiHashMap {
     if (Value<V>::isZero(v)) return;
 
     HashType h = primary_index_.computeHash(k);
-    T* elem = primary_index_.get(k, h);
-    if (elem) { 
+    primary_index_.get(k, h, [&] (auto elem) {
       elem->__av += v; 
-    }
-    else {
+    }, [&] {
       k.__av = v;
-      insert(k, h);
-    }
+      T* elem = pool_.acquire(k);
+      //primary_index_.check_size();
+      primary_index_.insert_lockless(elem, h);
+      secondary_indexes_.insert(elem);
+    });
   }
 
   FORCE_INLINE void addOrDelOnZero(T& k, const V& v) {
     if (Value<V>::isZero(v)) return;
 
     HashType h = primary_index_.computeHash(k);
-    T* elem = primary_index_.get(k, h);
-    if (elem) {
+    primary_index_.get(k, h, [&] (auto elem) {
       elem->__av += v;
-      if (Value<V>::isZero(elem->__av)) erase(elem, h);
-    }
-    else {
+      if (Value<V>::isZero(elem->__av)) {
+        primary_index_.erase_lockless(elem, h);
+        secondary_indexes_.erase(elem);
+        pool_.release(elem);
+      }
+    }, [&] {
       k.__av = v;
-      insert(k, h);
-    }
+      T* elem = pool_.acquire(k);
+      //primary_index_.check_size();
+      primary_index_.insert_lockless(elem, h);
+      secondary_indexes_.insert(elem);
+    });
   }
 
   FORCE_INLINE void setOrDelOnZero(T& k, const V& v) {
     HashType h = primary_index_.computeHash(k);
-    T* elem = primary_index_.get(k, h);
-    if (elem) {
-      if (Value<V>::isZero(v)) { erase(elem, h); }
+    primary_index_.get(k, h, [&] (auto elem) {
+      if (Value<V>::isZero(v)) {
+        primary_index_.erase_lockless(elem, h);
+        secondary_indexes_.erase(elem);
+        pool_.release(elem);
+      }
       else { elem->__av = v; }
-    }
-    else if (!Value<V>::isZero(v)) {
-      k.__av = v;
-      insert(k, h);
-    }
+    }, [&] {
+      if (!Value<V>::isZero(v)) {
+        k.__av = v;
+        T* elem = pool_.acquire(k);
+        //primary_index_.check_size();
+        primary_index_.insert_lockless(elem, h);
+        secondary_indexes_.insert(elem);
+      }
+    });
   }
 
   template <class Output>
